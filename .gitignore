@@ -1,0 +1,13 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+secrets.py
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
