@@ -79,6 +79,8 @@ class LLMJsonAgent:
                 "resources": state.resources,
                 "longest_road_owner": state.longest_road_owner,
                 "largest_army_owner": state.largest_army_owner,
+                "robber_position": state.robber_position,
+                "pending_discard": state.pending_discard,
             },
             indent=2,
         )
@@ -96,17 +98,26 @@ class LLMJsonAgent:
 
         if t == ActionType.BUILD_CITY:
             coords = p.get("coords")
-            return f"{idx}: BUILD_CITY at coords={coords}"
+            return f"{idx}: BUILD_CITY at coords={coords} (upgrade settlement to city)"
 
         if t == ActionType.BUILD_ROAD:
             path = p.get("path")
             return f"{idx}: BUILD_ROAD along path={path}"
 
         if t == ActionType.TRADE:
-            # current env.py: gift-style trade (we can refine rules later)
             to_player = p.get("to_player")
             resource = p.get("resource")
             return f"{idx}: TRADE give 1 {resource} to player {to_player}"
+
+        if t == ActionType.BANK_TRADE:
+            give = p.get("give")
+            receive = p.get("receive")
+            return f"{idx}: BANK_TRADE give 4 {give} for 1 {receive}"
+
+        if t == ActionType.DISCARD:
+            resource = p.get("resource")
+            count = p.get("count")
+            return f"{idx}: DISCARD {count} {resource} (required after rolling 7)"
 
         if t == ActionType.END_TURN:
             return f"{idx}: END_TURN"
@@ -166,10 +177,19 @@ class LLMJsonAgent:
         my_idx = state.current_player_index
         my_vp = vps[my_idx]
         leader_vp = max(vps)
+        my_resources = state.resources[my_idx]
+        total_resources = sum(my_resources.values())
+
+        # Special context for discard phase
+        context_hint = ""
+        if state.pending_discard:
+            context_hint = "\n⚠️ DISCARD PHASE: You rolled a 7 and have >7 cards. You MUST discard half your cards."
 
         system_prompt = (
             "You are a strong Settlers of Catan bot. "
             "Always follow the rules. "
+            "Prioritize building settlements and cities to gain victory points. "
+            "Use bank trades (4:1) when you have excess resources. "
             "You must output ONLY valid JSON of the form "
             '{"action_index": <integer>} and nothing else.'
         )
@@ -182,11 +202,20 @@ Game state (JSON):
 
 Interpreting the state:
 - You are player index {my_idx}.
-- Your victory points: {my_vp}
+- Your victory points: {my_vp} / {10} needed to win
 - Highest victory points at table: {leader_vp}
+- Your total resources: {total_resources} cards
+- Robber position: {state.robber_position}
+{context_hint}
 
 Available discrete actions (choose exactly ONE by index):
 {actions_text}
+
+Strategy tips:
+- BUILD_SETTLEMENT and BUILD_CITY give victory points (highest priority)
+- BANK_TRADE (4:1) helps when you have 4+ of one resource
+- Only END_TURN when you can't do anything productive
+- DISCARD actions are mandatory when prompted
 
 Return ONLY a JSON object, no explanation, no extra keys.
 The object MUST look like:
@@ -200,6 +229,9 @@ The object MUST look like:
 
         raw = self.chat_fn(messages)
 
+        # Check if API returned a fallback/error response
+        api_failed = (raw == '{"action_index": 0}')
+        
         used_fallback = False
         valid_index = False
         chosen_idx = 0  # default
@@ -217,10 +249,12 @@ The object MUST look like:
         if not valid_index:
             # Fallback heuristic:
             #   1) Prefer any build action (settlement/city/road)
-            #   2) Else prefer END_TURN
-            #   3) Else index 0
+            #   2) Prefer bank trades if we have 4+ of something
+            #   3) Else prefer END_TURN
+            #   4) Else index 0
             used_fallback = True
 
+            # Priority 1: Build actions
             build_indices = [
                 i
                 for i, a in enumerate(legal_actions)
@@ -233,20 +267,48 @@ The object MUST look like:
             if build_indices:
                 chosen_idx = build_indices[0]
             else:
-                end_indices = [
-                    i
-                    for i, a in enumerate(legal_actions)
-                    if a.type == ActionType.END_TURN
+                # Priority 2: Bank trades
+                bank_indices = [
+                    i for i, a in enumerate(legal_actions)
+                    if a.type == ActionType.BANK_TRADE
                 ]
-                if end_indices:
-                    chosen_idx = end_indices[0]
+                if bank_indices:
+                    chosen_idx = bank_indices[0]
                 else:
-                    chosen_idx = 0
+                    # Priority 3: Discard actions (during robber phase)
+                    discard_indices = [
+                        i for i, a in enumerate(legal_actions)
+                        if a.type == ActionType.DISCARD
+                    ]
+                    if discard_indices:
+                        chosen_idx = discard_indices[0]
+                    else:
+                        # Priority 4: END_TURN
+                        end_indices = [
+                            i
+                            for i, a in enumerate(legal_actions)
+                            if a.type == ActionType.END_TURN
+                        ]
+                        if end_indices:
+                            chosen_idx = end_indices[0]
+                        else:
+                            # Last resort: first action (if list not empty)
+                            chosen_idx = 0 if legal_actions else None
 
-        self.last_decision_info = StepDecisionInfo(
-            raw_response=raw,
-            valid_index=valid_index,
-            used_fallback=used_fallback,
-        )
-
-        return legal_actions[chosen_idx]
+        # Safety check
+        if legal_actions and 0 <= chosen_idx < len(legal_actions):
+            self.last_decision_info = StepDecisionInfo(
+                raw_response=raw,
+                valid_index=valid_index and not api_failed,  # Mark API failures
+                used_fallback=used_fallback or api_failed,
+            )
+            return legal_actions[chosen_idx]
+        else:
+            # Emergency fallback: create a safe END_TURN action
+            print(f"⚠️ No valid actions available! Creating emergency END_TURN")
+            self.last_decision_info = StepDecisionInfo(
+                raw_response=raw,
+                valid_index=False,
+                used_fallback=True,
+            )
+            return Action(ActionType.END_TURN, payload={})

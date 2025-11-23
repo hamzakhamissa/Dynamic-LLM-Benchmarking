@@ -98,3 +98,6 @@ class GameOrchestrator:
         for _ in range(n_games):
             results.append(self.play_single_game())
         return results
+
+    # if env_info.get("action_failed", False):
+    #     step_meta["llm_used_fallback"] = True

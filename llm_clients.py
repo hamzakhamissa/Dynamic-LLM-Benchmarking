@@ -32,7 +32,7 @@ def openai_chat_fn(messages: List[Dict[str, str]]) -> str:
         text = resp.choices[0].message.content
         return text if text else '{"action_index": 0}'
     except Exception as e:
-        print(f"❌ OpenAI API error: {e}")
+        print(f"⚠️ OpenAI API error: {e}")
         # Safe fallback so the game keeps going even if the API dies
         return '{"action_index": 0}'
 
@@ -83,14 +83,16 @@ def claude_chat_fn(messages: List[Dict[str, str]]) -> str:
         
         return text if text else '{"action_index": 0}'
     except Exception as e:
-        print(f"❌ Claude API error: {e}")
+        print(f"⚠️ Claude API error: {e}")
         return '{"action_index": 0}'
 
 
 def gemini_chat_fn(messages: List[Dict[str, str]]) -> str:
     """
-    Gemini -> Gemini 2.5 Flash (cheapest Gemini model)
+    Gemini -> Gemini 2.5 
     Returns a JSON string like {"action_index": 3}.
+    
+    NOTE: This model can timeout. We handle it gracefully.
     """
     try:
         import google.generativeai as genai
@@ -100,60 +102,88 @@ def gemini_chat_fn(messages: List[Dict[str, str]]) -> str:
     try:
         genai.configure(api_key=secrets.GEMINI_API_KEY)
 
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        # Use experimental model with better JSON support
+        model = genai.GenerativeModel(
+            "gemini-2.5-flash",
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.3,
+                "max_output_tokens": 100,  # Keep it short
+            }
+        )
 
+        # Combine all messages into a single prompt
         combined = []
         for m in messages:
             role = m.get("role", "").upper()
             content = m.get("content", "")
-            combined.append(f"{role}: {content}\n")
+            if role == "SYSTEM":
+                combined.append(f"INSTRUCTIONS: {content}\n")
+            else:
+                combined.append(f"{content}\n")
         prompt = "".join(combined)
+
+        # Add explicit JSON formatting instruction
+        prompt += "\n\nYou MUST respond with ONLY a JSON object in this exact format: {\"action_index\": <number>}"
 
         resp = model.generate_content(
             prompt,
-            generation_config={
-                # Force JSON
-                "response_mime_type": "application/json",
-                "max_output_tokens": 64,
-                "temperature": 0.3,
-            },
-            request_options={"timeout": 20},
+            request_options={"timeout": 10},  # Short timeout to fail fast
         )
 
-        # --- robust extraction ---
+        # Robust text extraction
         text = None
-
-        # Prefer structured parts
-        if getattr(resp, "candidates", None):
-            cand = resp.candidates[0]
-            if getattr(cand, "content", None) and cand.content.parts:
-                # Parts can be text or JSON; both support `.text` here
-                parts = cand.content.parts
-                buf = []
-                for p in parts:
-                    # some SDK versions use .text, some .function_call, etc
-                    if hasattr(p, "text") and p.text:
-                        buf.append(p.text)
-                text = "".join(buf).strip() if buf else None
-
-        # If we still have nothing, try `resp.text` as a best-effort
+        
+        # Try multiple extraction methods
+        try:
+            # Method 1: Direct text attribute
+            if hasattr(resp, 'text') and resp.text:
+                text = resp.text.strip()
+        except Exception:
+            pass
+        
         if not text:
             try:
-                text = resp.text.strip()
+                # Method 2: Via candidates
+                if hasattr(resp, 'candidates') and resp.candidates:
+                    cand = resp.candidates[0]
+                    if hasattr(cand, 'content') and cand.content.parts:
+                        parts_text = []
+                        for part in cand.content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                parts_text.append(part.text)
+                        if parts_text:
+                            text = "".join(parts_text).strip()
             except Exception:
-                text = None
-
+                pass
+        
         if not text:
-            print("❌ Gemini returned no usable text; falling back to default action.")
+            print("⚠️ Gemini returned empty response; using fallback")
             return '{"action_index": 0}'
 
-        # At this point `text` *should* be JSON, but we still guard in the agent.
-        print(f"✅ Gemini raw text: {text[:80]}...")
-        return text
+        # Validate it's actually JSON
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            # Try to extract JSON from the response
+            import re
+            match = re.search(r'\{[^}]*"action_index"[^}]*\}', text)
+            if match:
+                return match.group(0)
+            else:
+                print(f"⚠️ Gemini returned non-JSON: {text[:100]}")
+                return '{"action_index": 0}'
 
     except Exception as e:
-        print(f"❌ Gemini API error: {e}")
+        # Log the specific error type
+        error_msg = str(e)
+        if "504" in error_msg or "timeout" in error_msg.lower():
+            print(f"⚠️ Gemini TIMEOUT: {error_msg[:100]}")
+        else:
+            print(f"⚠️ Gemini API error: {error_msg[:100]}")
         return '{"action_index": 0}'
+
 
 def grok_chat_fn(messages: List[Dict[str, str]]) -> str:
     """
@@ -166,12 +196,11 @@ def grok_chat_fn(messages: List[Dict[str, str]]) -> str:
         raise RuntimeError("pip install xai-sdk") from e
 
     try:
-        client = Client(api_key=secrets.GROK_API_KEY, timeout=3600)
+        # Much shorter timeout: 30 seconds max
+        client = Client(api_key=secrets.GROK_API_KEY, timeout=30)
 
-        # Use the model you requested
         chat = client.chat.create(model="grok-4-fast-reasoning")
 
-        # Convert OpenAI-style messages to xAI-style chat calls
         for m in messages:
             role = m.get("role")
             content = m.get("content", "")
@@ -181,10 +210,8 @@ def grok_chat_fn(messages: List[Dict[str, str]]) -> str:
                 chat.append(x_user(content))
 
         response = chat.sample()
-
         text = str(response.content).strip()
-        # Ensure we always return something JSON-like
         return text if text else '{"action_index": 0}'
     except Exception as e:
-        print(f"Grok API error: {e}")
+        print(f"⚠️ Grok API error (timeout or network issue): {e}")
         return '{"action_index": 0}'
