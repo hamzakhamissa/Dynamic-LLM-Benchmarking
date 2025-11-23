@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -19,24 +20,33 @@ from llm_clients import (
     openai_chat_fn,
     claude_chat_fn,
     # gemini_chat_fn,
-    grok_chat_fn
+    grok_chat_fn,
+    local_stub_chat_fn,
 )
 
 
-def build_agents():
+def build_agents(use_remote_llms: bool = False):
     """
-    3 LLM agents (OpenAI, Claude, Grok) + 1 random baseline.
+    Build either real LLM agents (requires credentials/network) or fast offline agents.
 
-    Player 0: OpenAI (gpt-5-nano)
-    Player 1: Claude (Haiku 4.5)
-    Player 2: Grok (4-fast-reasoning)
-    Player 3: Random baseline
+    When `use_remote_llms` is False (default), we avoid any external API calls to
+    keep local runs quick and reliable. The first player uses a deterministic stub
+    chat function to exercise the LLM parsing logic without leaving the machine;
+    the remaining three players are random baselines.
     """
+    if use_remote_llms:
+        return [
+            LLMJsonAgent("OpenAI_gpt-5-nano", openai_chat_fn),
+            LLMJsonAgent("Claude_Haiku_4.5", claude_chat_fn),
+            LLMJsonAgent("Grok_4_fast_reasoning", grok_chat_fn),
+            RandomAgent("Random_baseline"),
+        ]
+
     return [
-        LLMJsonAgent("OpenAI_gpt-5-nano", openai_chat_fn),    
-        LLMJsonAgent("Claude_Haiku_4.5", claude_chat_fn),            
-        LLMJsonAgent("Grok_4_fast_reasoning", grok_chat_fn),         
-        RandomAgent("Random_baseline"),
+        LLMJsonAgent("Stub_LLM_Player", local_stub_chat_fn),
+        RandomAgent("Random_1"),
+        RandomAgent("Random_2"),
+        RandomAgent("Random_3"),
     ]
 
 
@@ -102,15 +112,25 @@ def save_results_to_json(results, metrics, filename=None):
 
 
 def main():
+    use_remote_llms = os.getenv("USE_REMOTE_LLMS", "0") == "1"
+    n_games = int(os.getenv("N_GAMES", "1"))
+
     print("=" * 60)
-    print("4 LLM AGENTS: OpenAI / Claude / Gemini / Grok")
+    if use_remote_llms:
+        print("4 LLM AGENTS: OpenAI / Claude / Gemini / Grok")
+    else:
+        print("4 OFFLINE AGENTS: Stub LLM + 3 Random baselines")
     print("=" * 60)
     print("Models:")
-    print("  - OpenAI : gpt-5-nano")
-    print("  - Claude : claude-haiku-4-5-20251001")
-    print("  - Gemini : gemini-2.5-flash")
-    print("  - Grok   : grok-4-fast-reasoning")
-    print(f"Games: 1")
+    if use_remote_llms:
+        print("  - OpenAI : gpt-5-nano")
+        print("  - Claude : claude-haiku-4-5-20251001")
+        print("  - Gemini : gemini-2.5-flash")
+        print("  - Grok   : grok-4-fast-reasoning")
+    else:
+        print("  - Stub   : local JSON stub (always index 0)")
+        print("  - Random : three random baselines")
+    print(f"Games: {n_games}")
     print(f"Max turns: 50")
     print("=" * 60 + "\n")
     
@@ -121,12 +141,10 @@ def main():
         seed=42,
     )
 
-    agents = build_agents()
+    agents = build_agents(use_remote_llms)
     orchestrator = GameOrchestrator(engine, agents)
-
-    # Just 1 game for initial testing
-    n_games = 2
-    
+    agent_names = [a.name for a in agents]
+    # Just 1 game for initial testing (override via N_GAMES)
     print("Starting game...\n")
     results = orchestrator.play_many_games(n_games=n_games)
     
@@ -151,9 +169,8 @@ def main():
     print("\n" + "="*60)
     print("RESULTS SUMMARY")
     print("="*60)
-    
+
     print("\n=== Win rates ===")
-    agent_names = ["GPT-4o-mini", "Random_1", "Random_2", "Random_3"]
     for i, rate in win_rates.items():
         print(f"{agent_names[i]:<20} (Player {i}): {rate:.3f}")
 

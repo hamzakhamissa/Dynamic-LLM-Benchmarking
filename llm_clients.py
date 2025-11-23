@@ -7,6 +7,16 @@ import json
 import secrets  # your own secrets.py (NOT committed to git)
 
 
+def local_stub_chat_fn(messages: List[Dict[str, str]]) -> str:
+    """
+    Fast, offline-safe chat function that always returns the first action index.
+
+    This keeps the game loop moving without making any external API calls and
+    avoids hanging when credentials or network access are unavailable.
+    """
+    return json.dumps({"action_index": 0})
+
+
 def openai_chat_fn(messages: List[Dict[str, str]]) -> str:
     
     try:

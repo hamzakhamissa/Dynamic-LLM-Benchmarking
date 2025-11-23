@@ -6,8 +6,13 @@ from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 import random
 
-from pycatan import Game as PyCatanGame, Resource
-from pycatan.board import RandomBoard, Coords
+
+class Resource(Enum):
+    BRICK = auto()
+    LUMBER = auto()
+    WOOL = auto()
+    GRAIN = auto()
+    ORE = auto()
 
 
 class ActionType(Enum):
@@ -16,6 +21,128 @@ class ActionType(Enum):
     BUILD_CITY = auto()
     TRADE = auto()          # gift-style trade: give 1 resource to another player
     END_TURN = auto()
+
+
+class BuildingType(Enum):
+    SETTLEMENT = auto()
+    CITY = auto()
+
+
+@dataclass
+class Building:
+    owner: "Player"
+    building_type: BuildingType
+
+
+class Player:
+    def __init__(self) -> None:
+        self.resources: Dict[Resource, int] = {}
+        self.roads: set[Tuple[int, int]] = set()
+
+    def has_resources(self, cost: Dict[Resource, int]) -> bool:
+        return all(self.resources.get(res, 0) >= amt for res, amt in cost.items())
+
+    def pay_resources(self, cost: Dict[Resource, int]) -> None:
+        for res, amt in cost.items():
+            self.resources[res] = self.resources.get(res, 0) - amt
+
+
+class StubBoard:
+    """Minimal board to keep tests running without the real pycatan dependency."""
+
+    def __init__(self, rng: random.Random) -> None:
+        # 12 intersections arranged linearly; 11 connecting paths
+        self.intersections: Dict[int, Optional[Building]] = {i: None for i in range(12)}
+        self.paths: Dict[Tuple[int, int], Optional[Player]] = {
+            (i, i + 1): None for i in range(11)
+        }
+        self.rng = rng
+
+    def get_valid_settlement_coords(self, player: Player, ensure_connected: bool) -> List[int]:
+        # Allow building on any empty intersection
+        return [c for c, b in self.intersections.items() if b is None]
+
+    def assert_valid_road_coords(
+        self, player: Player, path_coords: Tuple[int, int], ensure_connected: bool
+    ) -> None:
+        if path_coords not in self.paths:
+            raise ValueError("Invalid path")
+        if self.paths[path_coords] is not None:
+            raise ValueError("Path already taken")
+
+
+class StubGame:
+    def __init__(self, board: StubBoard, num_players: int, rng: random.Random) -> None:
+        self.board = board
+        self.players = [Player() for _ in range(num_players)]
+        self.longest_road_owner: Optional[Player] = None
+        self.largest_army_owner: Optional[Player] = None
+        self.rng = rng
+
+    def build_settlement(
+        self,
+        player: Player,
+        coords: int,
+        cost_resources: bool,
+        ensure_connected: bool,
+    ) -> None:
+        if coords not in self.board.intersections or self.board.intersections[coords] is not None:
+            raise ValueError("Invalid or occupied settlement location")
+        if cost_resources and not player.has_resources(SETTLEMENT_COST):
+            raise ValueError("Insufficient resources for settlement")
+        if cost_resources:
+            player.pay_resources(SETTLEMENT_COST)
+        self.board.intersections[coords] = Building(owner=player, building_type=BuildingType.SETTLEMENT)
+
+    def build_road(
+        self,
+        player: Player,
+        path_coords: Tuple[int, int],
+        cost_resources: bool,
+        ensure_connected: bool,
+    ) -> None:
+        if path_coords not in self.board.paths:
+            raise ValueError("Invalid road path")
+        if self.board.paths[path_coords] is not None:
+            raise ValueError("Road already exists")
+        if cost_resources and not player.has_resources(ROAD_COST):
+            raise ValueError("Insufficient resources for road")
+        if cost_resources:
+            player.pay_resources(ROAD_COST)
+        self.board.paths[path_coords] = player
+        player.roads.add(path_coords)
+
+    def upgrade_settlement_to_city(
+        self, player: Player, coords: int, cost_resources: bool
+    ) -> None:
+        building = self.board.intersections.get(coords)
+        if building is None or building.owner is not player:
+            raise ValueError("No settlement to upgrade")
+        if building.building_type != BuildingType.SETTLEMENT:
+            raise ValueError("Already a city here")
+        if cost_resources and not player.has_resources(CITY_COST):
+            raise ValueError("Insufficient resources for city")
+        if cost_resources:
+            player.pay_resources(CITY_COST)
+        self.board.intersections[coords] = Building(owner=player, building_type=BuildingType.CITY)
+
+    def add_yield_for_roll(self, roll: int) -> None:
+        # Give each player one random resource to keep the game progressing.
+        for player in self.players:
+            res = self.rng.choice(RESOURCE_LIST)
+            player.resources[res] = player.resources.get(res, 0) + 1
+
+    def get_victory_points(self, player: Player) -> int:
+        vp = 0
+        for building in self.board.intersections.values():
+            if building is None or building.owner is not player:
+                continue
+            vp += 2 if building.building_type == BuildingType.CITY else 1
+        return vp
+
+
+PyCatanGame = StubGame
+Coords = int
 
 
 @dataclass(frozen=True)
@@ -87,11 +214,12 @@ CITY_COST = {
 
 class PyCatanEngine(CatanEngine):
     """
-    Thin wrapper around pycatan.Game.
+    Lightweight, dependency-free Catan-style engine.
 
     Simplifications:
-    - Initial placement: 1 free settlement per player on random valid intersection.
-    - No dev cards / robber logic for now.
+    - Minimal board (12 intersections in a line, 11 paths).
+    - One free starting settlement for each player.
+    - Per-turn resource drip so actions remain available.
     - Trade = one-way "gift" of 1 resource from current player to another.
     """
 
@@ -114,10 +242,15 @@ class PyCatanEngine(CatanEngine):
     # ------------- Public API -------------
 
     def start_game(self) -> GameState:
-        board = RandomBoard()
-        self.game = PyCatanGame(board, num_players=self.num_players)
+        board = StubBoard(self.rng)
+        self.game = PyCatanGame(board, num_players=self.num_players, rng=self.rng)
         self.turn = 0
         self.current_player_index = 0
+
+        # Seed each player with a few starting resources so they can act.
+        for player in self.game.players:
+            for res in RESOURCE_LIST:
+                player.resources[res] = 2
 
         # One free starting settlement for each player
         for idx, player in enumerate(self.game.players):
@@ -295,33 +428,21 @@ class PyCatanEngine(CatanEngine):
             return actions
 
         # Upgrade any existing settlement belonging to this player
-        # The pycatan library structure: intersection.building has owner, not player
-        for coords, intersection in self.game.board.intersections.items():
-            building = intersection.building
+        for coords, building in self.game.board.intersections.items():
             if building is None:
                 continue
-            
-            # Check if this building belongs to the current player
-            # Try different attribute names that pycatan might use
-            building_owner = None
-            if hasattr(building, 'owner'):
-                building_owner = building.owner
-            elif hasattr(building, 'player'):
-                building_owner = building.player
-            
+
+            building_owner = getattr(building, "owner", None)
             if building_owner is not player:
                 continue
-            
-            # Check if it's a settlement (not already a city)
-            building_type = None
-            if hasattr(building, 'building_type'):
-                building_type = building.building_type.name
-            elif hasattr(building, 'type'):
-                building_type = building.type.name
-            
+
+            building_type = getattr(building, "building_type", None)
+            if isinstance(building_type, Enum):
+                building_type = building_type.name
+
             if building_type != "SETTLEMENT":
                 continue
-            
+
             actions.append(
                 Action(
                     ActionType.BUILD_CITY,
@@ -332,13 +453,13 @@ class PyCatanEngine(CatanEngine):
         return actions
 
     def _trade_actions(self, player: Player) -> List[Action]:
-        
+
         actions: List[Action] = []
 
         # Current player's resources
-        player_res = self._player_resources(self.game.current_player_index)
+        player_res = self._player_resources(self.current_player_index)
         # Resource types present in this game
-        res_types = [r for r in ["wood", "brick", "sheep", "wheat", "ore"]]
+        res_types = [r.name.lower() for r in RESOURCE_LIST]
 
         # If player has no resources, they can't offer anything
         if sum(player_res.values()) == 0:
@@ -348,62 +469,41 @@ class PyCatanEngine(CatanEngine):
             if player_res.get(give_res, 0) <= 0:
                 continue  # can't offer what you don't have
 
-            for get_res in res_types:
-                if get_res == give_res:
-                    continue  # 1-for-1 trade of same type is pointless
+            for other_idx in range(self.num_players):
+                if other_idx == self.current_player_index:
+                    continue
 
-                for other_idx in range(self.n_players):
-                    if other_idx == self.game.current_player_index:
-                        continue
-
-                    other_player = self.game.players[other_idx]
-                    other_res = self._player_resources(other_idx)
-
-                    # Other player must be able to pay the requested resource
-                    if other_res.get(get_res, 0) <= 0:
-                        continue
-
-                    actions.append(
-                        Action(
-                            type=ActionType.TRADE,
-                            payload={
-                                "to_player": other_idx,
-                                "give_resource": give_res,
-                                "get_resource": get_res,
-                            },
-                        )
+                actions.append(
+                    Action(
+                        type=ActionType.TRADE,
+                        payload={
+                            "to_player": other_idx,
+                            "resource": give_res,
+                        },
                     )
+                )
 
         return actions
 
 
 
-    def _apply_trade(self, action: Action) -> None:
+    def _apply_trade(self, from_idx: int, to_idx: int, res_name: str) -> None:
         """
-        Apply a 1-for-1 trade:
-        - current player gives 1 `give_resource`
-        - and receives 1 `get_resource`
+        Apply a gift trade: transfer one unit of `res_name` from the current player
+        to another player.
         """
-        give_res = action.payload["give_resource"]
-        get_res = action.payload["get_resource"]
-        to_idx = action.payload["to_player"]
+        assert self.game is not None
 
-        from_idx = self.game.current_player_index
-        from_player = self.game.current_player
+        res_enum = Resource[res_name.upper()]
+        from_player = self.game.players[from_idx]
         to_player = self.game.players[to_idx]
 
-        # Sanity checks (should already be enforced by _trade_actions)
-        if from_player.resources.get(give_res, 0) <= 0:
-            return
-        if to_player.resources.get(get_res, 0) <= 0:
+        # Sanity check (should already be enforced by _trade_actions)
+        if from_player.resources.get(res_enum, 0) <= 0:
             return
 
-        # Execute trade: 1-for-1 swap
-        from_player.resources[give_res] -= 1
-        to_player.resources[give_res] = to_player.resources.get(give_res, 0) + 1
-
-        to_player.resources[get_res] -= 1
-        from_player.resources[get_res] = from_player.resources.get(get_res, 0) + 1
+        from_player.resources[res_enum] -= 1
+        to_player.resources[res_enum] = to_player.resources.get(res_enum, 0) + 1
 
 
     def _export_state(self) -> GameState:
