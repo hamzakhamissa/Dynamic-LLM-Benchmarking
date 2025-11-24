@@ -1,4 +1,4 @@
-# agents.py
+# agents.py - Enhanced with better parsing and clearer prompts
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,13 +9,7 @@ import re
 
 from env import Action, ActionType, GameState
 
-# A chat function takes OpenAI-style messages and returns a *string* response
 ChatFn = Callable[[List[Dict[str, str]]], str]
-"""
-Expected behavior:
-- Input:  messages = [{"role": "system"|"user"|"assistant", "content": "..."}]
-- Output: string that *should* contain JSON like: {"action_index": 3}
-"""
 
 
 @dataclass
@@ -23,54 +17,38 @@ class StepDecisionInfo:
     raw_response: str
     valid_index: bool
     used_fallback: bool
+    api_error: bool  # NEW: track if API failed
 
 
 class RandomAgent:
-    """
-    Simple random policy, used as a baseline or filler when not using an LLM.
-    """
+    """Simple random policy baseline."""
 
     def __init__(self, name: str, seed: Optional[int] = None) -> None:
         self.name = name
         self.rng = random.Random(seed)
         self.last_decision_info: Optional[StepDecisionInfo] = None
 
-    def choose_action(
-        self, state: GameState, legal_actions: List[Action]
-    ) -> Action:
-        # Random baseline always has "valid" index and never uses fallback logic.
+    def choose_action(self, state: GameState, legal_actions: List[Action]) -> Action:
         action = self.rng.choice(legal_actions)
         self.last_decision_info = StepDecisionInfo(
             raw_response="(random)",
             valid_index=True,
             used_fallback=False,
+            api_error=False,
         )
         return action
 
 
 class LLMJsonAgent:
-    """
-    Wraps an LLM that returns JSON and chooses an action index.
-
-    The model sees:
-      - a compact JSON summary of the game state
-      - a numbered list of candidate actions as natural language
-
-    It must output:
-      { "action_index": <integer> }
-    """
+    """LLM agent with improved JSON parsing and clearer prompts."""
 
     def __init__(self, name: str, chat_fn: ChatFn) -> None:
         self.name = name
         self.chat_fn = chat_fn
         self.last_decision_info: Optional[StepDecisionInfo] = None
 
-    # --------- Helpers for prompt construction ---------
-
     def _serialize_state(self, state: GameState) -> str:
-        """
-        Convert GameState into JSON-serializable dict.
-        """
+        """Convert GameState into JSON."""
         return json.dumps(
             {
                 "turn": state.turn,
@@ -86,51 +64,46 @@ class LLMJsonAgent:
         )
 
     def _describe_action(self, idx: int, action: Action) -> str:
-        """
-        Turn an Action into a human-readable line that the LLM can reason about.
-        """
+        """Convert action to clear, readable description."""
         t = action.type
         p = action.payload
 
         if t == ActionType.BUILD_SETTLEMENT:
             coords = p.get("coords")
-            return f"{idx}: BUILD_SETTLEMENT at coords={coords}"
+            return f"{idx}. BUILD_SETTLEMENT at location {coords} [Costs: 1 brick, 1 lumber, 1 wool, 1 grain] [Gain: +1 VP]"
 
         if t == ActionType.BUILD_CITY:
             coords = p.get("coords")
-            return f"{idx}: BUILD_CITY at coords={coords} (upgrade settlement to city)"
+            return f"{idx}. BUILD_CITY at location {coords} (upgrade settlement) [Costs: 3 ore, 2 grain] [Gain: +1 VP]"
 
         if t == ActionType.BUILD_ROAD:
             path = p.get("path")
-            return f"{idx}: BUILD_ROAD along path={path}"
+            return f"{idx}. BUILD_ROAD on path {path} [Costs: 1 brick, 1 lumber]"
 
         if t == ActionType.TRADE:
             to_player = p.get("to_player")
             resource = p.get("resource")
-            return f"{idx}: TRADE give 1 {resource} to player {to_player}"
+            return f"{idx}. TRADE: Give 1 {resource} to Player {to_player}"
 
         if t == ActionType.BANK_TRADE:
             give = p.get("give")
             receive = p.get("receive")
-            return f"{idx}: BANK_TRADE give 4 {give} for 1 {receive}"
+            return f"{idx}. BANK_TRADE: Give 4 {give} → Get 1 {receive}"
 
         if t == ActionType.DISCARD:
             resource = p.get("resource")
             count = p.get("count")
-            return f"{idx}: DISCARD {count} {resource} (required after rolling 7)"
+            return f"{idx}. DISCARD {count} {resource} (required: robber rolled 7)"
 
         if t == ActionType.END_TURN:
-            return f"{idx}: END_TURN"
+            return f"{idx}. END_TURN (finish your turn)"
 
-        return f"{idx}: UNKNOWN_ACTION payload={p}"
+        return f"{idx}. UNKNOWN_ACTION"
 
     def _extract_json(self, raw: str) -> Optional[Dict[str, Any]]:
         """
-        Try hard to recover a JSON object from the LLM's response.
-        Handles:
-          - pure JSON:        {"action_index": 3}
-          - fenced code:      ```json { "action_index": 3 } ```
-          - explanations:     "I choose... {\"action_index\": 3} because..."
+        Aggressively extract JSON from LLM response.
+        Handles: pure JSON, markdown fences, explanations, etc.
         """
         # 1) Direct parse
         try:
@@ -138,39 +111,37 @@ class LLMJsonAgent:
         except Exception:
             pass
 
-        # 2) Strip common markdown fences
-        cleaned = re.sub(r"```json\s*|\s*```", "", raw, flags=re.IGNORECASE)
+        # 2) Strip markdown fences
+        cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw, flags=re.IGNORECASE)
         try:
             return json.loads(cleaned.strip())
         except Exception:
             pass
 
-        # 3) Grep the first {...} block
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        # 3) Find first {...} block
+        match = re.search(r"\{[^}]*\"action_index\"[^}]*\}", raw, flags=re.DOTALL)
         if match:
-            candidate = match.group(0)
             try:
-                return json.loads(candidate)
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+
+        # 4) Try finding just the number after "action_index"
+        match = re.search(r"['\"]?action_index['\"]?\s*:\s*(\d+)", raw, flags=re.IGNORECASE)
+        if match:
+            try:
+                return {"action_index": int(match.group(1))}
             except Exception:
                 pass
 
         return None
 
-    # --------- Main policy ---------
-
-    def choose_action(
-        self, state: GameState, legal_actions: List[Action]
-    ) -> Action:
+    def choose_action(self, state: GameState, legal_actions: List[Action]) -> Action:
         """
-        1. Build a prompt from GameState + legal actions.
-        2. Call LLM via chat_fn.
-        3. Parse JSON -> action_index.
-        4. If anything goes wrong, fall back to a safe heuristic action.
+        Main decision logic with improved error handling.
         """
         state_json = self._serialize_state(state)
-        action_lines = [
-            self._describe_action(i, a) for i, a in enumerate(legal_actions)
-        ]
+        action_lines = [self._describe_action(i, a) for i, a in enumerate(legal_actions)]
         actions_text = "\n".join(action_lines)
 
         vps = list(state.victory_points)
@@ -180,135 +151,168 @@ class LLMJsonAgent:
         my_resources = state.resources[my_idx]
         total_resources = sum(my_resources.values())
 
-        # Special context for discard phase
+        # Get opponent info for trading context
+        opponent_vps = [(idx, vps[idx]) for idx in range(len(vps)) if idx != my_idx]
+        opponent_vps.sort(key=lambda x: x[1], reverse=True)  # Sort by VP
+        leader_idx, leader_vp = opponent_vps[0] if opponent_vps else (None, 0)
+        weakest_idx, weakest_vp = opponent_vps[-1] if opponent_vps else (None, 0)
+        
+        trading_hint = ""
+        if leader_idx is not None and my_vp < leader_vp:
+            trading_hint = f"\n💡 Trading tip: Player {leader_idx} is leading with {leader_vp} VP. Avoid giving them resources!"
+            if weakest_idx is not None and weakest_idx != leader_idx:
+                trading_hint += f"\n   Consider trading with Player {weakest_idx} ({weakest_vp} VP) to build an alliance."
         context_hint = ""
         if state.pending_discard:
-            context_hint = "\n⚠️ DISCARD PHASE: You rolled a 7 and have >7 cards. You MUST discard half your cards."
+            discard_count = total_resources // 2
+            context_hint = f"""
+⚠️ DISCARD PHASE ACTIVE ⚠️
+You rolled a 7 and have {total_resources} cards (>7 limit).
+You MUST discard {discard_count} cards immediately.
+Look for DISCARD actions in the list below and choose one.
+DO NOT choose BUILD or TRADE actions during discard phase.
+"""
 
-        system_prompt = (
-            "You are a strong Settlers of Catan bot. "
-            "Always follow the rules. "
-            "Prioritize building settlements and cities to gain victory points. "
-            "Use bank trades (4:1) when you have excess resources. "
-            "You must output ONLY valid JSON of the form "
-            '{"action_index": <integer>} and nothing else.'
-        )
+        system_prompt = """You are an expert Settlers of Catan AI player.
 
-        user_prompt = f"""
-You are playing a 4-player game of Settlers of Catan.
+Your task: Choose the BEST action from the numbered list provided.
 
-Game state (JSON):
+CRITICAL RULES:
+1. You must output ONLY valid JSON: {"action_index": <number>}
+2. The number must be from the provided action list (0 to N-1)
+3. No explanations, no extra text, just the JSON object
+4. During DISCARD phase, you MUST choose a DISCARD action
+
+Strategy priorities (in order):
+1. BUILD_SETTLEMENT and BUILD_CITY are TOP priority (they give victory points!)
+2. TRADE with other players strategically:
+   - Give resources to players who are BEHIND (not to the leader!)
+   - This is better than hoarding - it builds alliances
+   - Even "bad" trades can help you win by slowing the leader
+3. Use BANK_TRADE when you have 4+ of one resource
+4. BUILD_ROAD to expand and get Longest Road bonus
+5. Only END_TURN when no productive actions are available
+
+Trading strategy:
+- Look at victory points before trading
+- NEVER help the player with the most victory points
+- DO help players who are behind - they might help you later
+- DISCARD actions are mandatory when the robber is rolled"""
+
+        user_prompt = f"""GAME STATE:
 {state_json}
 
-Interpreting the state:
-- You are player index {my_idx}.
-- Your victory points: {my_vp} / {10} needed to win
-- Highest victory points at table: {leader_vp}
-- Your total resources: {total_resources} cards
-- Robber position: {state.robber_position}
+YOUR STATUS:
+- You are Player {my_idx}
+- Your VP: {my_vp} / 10 needed to win
+- Leader VP: {leader_vp}
+- Your resources: {total_resources} cards total
+- Your hand: {my_resources}
+{trading_hint}
 {context_hint}
 
-Available discrete actions (choose exactly ONE by index):
+AVAILABLE ACTIONS (choose ONE by index):
 {actions_text}
 
-Strategy tips:
-- BUILD_SETTLEMENT and BUILD_CITY give victory points (highest priority)
-- BANK_TRADE (4:1) helps when you have 4+ of one resource
-- Only END_TURN when you can't do anything productive
-- DISCARD actions are mandatory when prompted
-
-Return ONLY a JSON object, no explanation, no extra keys.
-The object MUST look like:
-{{"action_index": <index_of_best_action>}}
-"""
+Remember: Output ONLY this format: {{"action_index": <number>}}
+Choose the action index that best helps you win the game.
+Consider: Building > Trading with weak players > Bank trades > END_TURN"""
 
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
+        # Call LLM
         raw = self.chat_fn(messages)
 
-        # Check if API returned a fallback/error response
-        api_failed = (raw == '{"action_index": 0}')
-        
+        # Check for API failure marker
+        api_failed = False
+        try:
+            temp_parse = json.loads(raw)
+            if temp_parse.get("error") == "api_failed":
+                api_failed = True
+        except:
+            pass
+
+        # Parse response
         used_fallback = False
         valid_index = False
-        chosen_idx = 0  # default
+        chosen_idx = 0
 
         parsed = self._extract_json(raw)
         if isinstance(parsed, dict) and "action_index" in parsed:
             idx = parsed["action_index"]
-            # tolerate string indices too
+            # Handle string indices
             if isinstance(idx, str) and idx.isdigit():
                 idx = int(idx)
             if isinstance(idx, int) and 0 <= idx < len(legal_actions):
                 chosen_idx = idx
                 valid_index = True
-
-        if not valid_index:
-            # Fallback heuristic:
-            #   1) Prefer any build action (settlement/city/road)
-            #   2) Prefer bank trades if we have 4+ of something
-            #   3) Else prefer END_TURN
-            #   4) Else index 0
-            used_fallback = True
-
-            # Priority 1: Build actions
-            build_indices = [
-                i
-                for i, a in enumerate(legal_actions)
-                if a.type in (
-                    ActionType.BUILD_SETTLEMENT,
-                    ActionType.BUILD_CITY,
-                    ActionType.BUILD_ROAD,
-                )
-            ]
-            if build_indices:
-                chosen_idx = build_indices[0]
+                print(f"✓ {self.name} chose action {chosen_idx}: {legal_actions[chosen_idx].type.name}")
             else:
-                # Priority 2: Bank trades
-                bank_indices = [
+                print(f"⚠️ {self.name} returned out-of-range index: {idx} (max: {len(legal_actions)-1})")
+
+        # Fallback if parsing failed or API failed
+        if not valid_index or api_failed:
+            used_fallback = True
+            print(f"⚠️ {self.name} using fallback (API failed: {api_failed})")
+
+            # Smart fallback priority
+            # 1) Discard if required
+            if state.pending_discard:
+                discard_indices = [
                     i for i, a in enumerate(legal_actions)
-                    if a.type == ActionType.BANK_TRADE
+                    if a.type == ActionType.DISCARD
                 ]
-                if bank_indices:
-                    chosen_idx = bank_indices[0]
+                if discard_indices:
+                    chosen_idx = discard_indices[0]
+                    print(f"   → Fallback chose DISCARD action {chosen_idx}")
+            
+            # 2) Build actions (highest priority)
+            if not state.pending_discard:
+                build_indices = [
+                    i for i, a in enumerate(legal_actions)
+                    if a.type in (ActionType.BUILD_SETTLEMENT, ActionType.BUILD_CITY, ActionType.BUILD_ROAD)
+                ]
+                if build_indices:
+                    chosen_idx = build_indices[0]
+                    print(f"   → Fallback chose BUILD action {chosen_idx}")
                 else:
-                    # Priority 3: Discard actions (during robber phase)
-                    discard_indices = [
+                    # 3) Bank trades
+                    bank_indices = [
                         i for i, a in enumerate(legal_actions)
-                        if a.type == ActionType.DISCARD
+                        if a.type == ActionType.BANK_TRADE
                     ]
-                    if discard_indices:
-                        chosen_idx = discard_indices[0]
+                    if bank_indices:
+                        chosen_idx = bank_indices[0]
+                        print(f"   → Fallback chose BANK_TRADE {chosen_idx}")
                     else:
-                        # Priority 4: END_TURN
+                        # 4) END_TURN
                         end_indices = [
-                            i
-                            for i, a in enumerate(legal_actions)
+                            i for i, a in enumerate(legal_actions)
                             if a.type == ActionType.END_TURN
                         ]
                         if end_indices:
                             chosen_idx = end_indices[0]
-                        else:
-                            # Last resort: first action (if list not empty)
-                            chosen_idx = 0 if legal_actions else None
+                            print(f"   → Fallback chose END_TURN {chosen_idx}")
 
         # Safety check
         if legal_actions and 0 <= chosen_idx < len(legal_actions):
             self.last_decision_info = StepDecisionInfo(
                 raw_response=raw,
-                valid_index=valid_index and not api_failed,  # Mark API failures
+                valid_index=valid_index and not api_failed,
                 used_fallback=used_fallback or api_failed,
+                api_error=api_failed,
             )
             return legal_actions[chosen_idx]
         else:
-            # Emergency fallback: create a safe END_TURN action
-            print(f"⚠️ No valid actions available! Creating emergency END_TURN")
+            # Emergency fallback
+            print(f"⚠️ {self.name} EMERGENCY FALLBACK")
             self.last_decision_info = StepDecisionInfo(
                 raw_response=raw,
                 valid_index=False,
                 used_fallback=True,
+                api_error=api_failed,
             )
             return Action(ActionType.END_TURN, payload={})

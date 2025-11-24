@@ -1,4 +1,4 @@
-# main.py - Enhanced benchmark with better tracking
+# main.py - Enhanced benchmark with better configuration
 from __future__ import annotations
 
 import json
@@ -20,34 +20,28 @@ from llm_clients import (
     openai_chat_fn,
     claude_chat_fn,
     gemini_chat_fn,
-    # grok_chat_fn
 )
 
 
 def build_agents():
     """
-    3 LLM agents (OpenAI, Claude, Gemini) + 1 random baseline.
-
+    3 LLM agents + 1 random baseline.
+    
     Player 0: OpenAI (gpt-5-nano)
-    Player 1: Claude (Haiku 4.5)
+    Player 1: Claude (Haiku 4.5) - Cheapest Claude model
     Player 2: Gemini (2.5 Flash)
     Player 3: Random baseline
-    
-    NOTE: Grok removed due to API instability/timeouts
     """
     return [
         LLMJsonAgent("OpenAI_gpt-5-nano", openai_chat_fn),
         LLMJsonAgent("Claude_Haiku_4.5", claude_chat_fn),
         LLMJsonAgent("Gemini_2.5_Flash", gemini_chat_fn),
         RandomAgent("Random_baseline", seed=42),
-        # LLMJsonAgent("Grok-4-fast-reasoning", grok_chat_fn)
     ]
 
 
 def save_results_to_json(results, metrics, filename=None):
-    """
-    Save game results and metrics to a JSON file for later analysis.
-    """
+    """Save results to JSON for analysis."""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"game_results_{timestamp}.json"
@@ -72,17 +66,17 @@ def save_results_to_json(results, metrics, filename=None):
                 "legal_actions_count": step.legal_actions_count,
                 "victory_points_before": step.state_before.victory_points,
                 "victory_points_after": step.state_after.victory_points,
-                "resources_before": step.state_before.resources,
-                "resources_after": step.state_after.resources,
                 "info": {
                     k: v for k, v in step.info.items()
-                    if k not in ["raw_llm_response"]
+                    if k not in ["raw_llm_response"]  # Exclude large text
                 },
             }
 
+            # Add LLM-specific tracking
             if "llm_valid_index" in step.info:
                 step_data["llm_valid_index"] = step.info["llm_valid_index"]
                 step_data["llm_used_fallback"] = step.info["llm_used_fallback"]
+                step_data["llm_api_error"] = step.info.get("llm_api_error", False)
             
             if "action_failed" in step.info:
                 step_data["action_failed"] = step.info["action_failed"]
@@ -101,57 +95,83 @@ def save_results_to_json(results, metrics, filename=None):
     with open(filename, "w") as f:
         json.dump(output, f, indent=2)
 
-    print(f"\ Results saved to: {filename}")
+    print(f"\n💾 Results saved to: {filename}")
     return filename
 
 
-def main():
-    # Config
-    n_games = 1  # Start with 5 for testing
-    target_vp = 8  # Lower from 10 to ensure wins (games finishing in 50-70 turns)
-    max_turns = 150  # Increased safety net
-
-    print("=" * 60)
-    print("DYNAMIC CATAN BENCHMARK v2.0")
-    print("=" * 60)
-    print("Models:")
-    print("  - OpenAI : gpt-5-nano")
-    print("  - Claude : claude-haiku-4-5-20251001")
-    print("  - Gemini : gemini-2.5-flash")
-    print("  - Baseline: Random_agent")
-    print(f"\nGame Settings:")
-    print(f"  - Games: {n_games}")
-    print(f"  - Victory Points: {target_vp}")
-    print(f"  - Max turns: {max_turns}")
-    print("=" * 60 + "\n")
-
-    engine = PyCatanEngine(
-        num_players=4,
-        target_vp=target_vp,
-        max_turns=max_turns,
-        seed=42,
-    )
-
-    agents = build_agents()
-    orchestrator = GameOrchestrator(engine, agents)
-
-    print("🎮 Starting games...\n")
-    results = orchestrator.play_many_games(n_games=n_games)
-
+def print_results(results, agents):
+    """Print formatted results."""
     avg_t = average_turns(results)
-    print(f"\n{'='*60}")
-    print(f"Completed {n_games} game(s)!")
-    print(f"Average turns per game: {avg_t:.1f}")
-    print(f"{'='*60}\n")
-
-    # Compute metrics
     win_rates = compute_win_rates(results)
     hall = hallucination_stats(results)
     trades = trade_behavior(results)
     efficiency = resource_efficiency(results)
     scores = overall_scores(results)
 
-    metrics = {
+    agent_names = [a.name for a in agents]
+
+    print("\n" + "=" * 70)
+    print("BENCHMARK RESULTS")
+    print("=" * 70)
+
+    print(f"\n📊 Games Completed: {len(results)}")
+    print(f"📈 Average Turns: {avg_t:.1f}")
+
+    print("\n🏆 WIN RATES")
+    print("-" * 70)
+    for i, rate in sorted(win_rates.items(), key=lambda x: x[1], reverse=True):
+        bar = "█" * int(rate * 50)
+        print(f"{agent_names[i]:<25} {rate:>6.1%} {bar}")
+
+    print("\n🧠 HALLUCINATION ANALYSIS")
+    print("-" * 70)
+    for i, st in hall.items():
+        print(f"\n{agent_names[i]} (Player {i}):")
+        print(f"  Total decisions:     {st['decisions']:>6.0f}")
+        print(f"  Index errors:        {st['index_hallucinations']:>6.0f}")
+        print(f"  Action failures:     {st['action_failures']:>6.0f}")
+        print(f"  Total hallucinations: {st['total_hallucinations']:>6.0f}")
+        print(f"  Hallucination rate:  {st['hallucination_rate']:>6.1%}")
+        print(f"  Penalty score:       {st['hallucination_penalty_score']:>6.3f}")
+
+    print("\n💰 TRADE BEHAVIOR")
+    print("-" * 70)
+    for i, st in trades.items():
+        print(f"\n{agent_names[i]} (Player {i}):")
+        print(f"  Player trades:       {st['num_player_trades']:>6.0f}")
+        print(f"  Bank trades:         {st['num_bank_trades']:>6.0f}")
+        print(f"  Total trades:        {st['total_trades']:>6.0f}")
+        if st['total_trades'] > 0:
+            print(f"  Helping leader:      {st['trades_helping_leader_ratio']:>6.1%}")
+            print(f"  Helping last place:  {st['trades_helping_last_ratio']:>6.1%}")
+
+    print("\n⚡ RESOURCE EFFICIENCY")
+    print("-" * 70)
+    for i, st in efficiency.items():
+        print(f"\n{agent_names[i]} (Player {i}):")
+        print(f"  Build rate:          {st['build_rate']:>6.3f} builds/turn")
+        print(f"  Avg final resources: {st['avg_final_resources']:>6.1f} cards")
+        print(f"  Efficiency score:    {st['efficiency_score']:>6.3f}")
+
+    print("\n🎯 OVERALL SCORES")
+    print("-" * 70)
+    print("Formula: win_rate × hallucination_penalty × (0.5 + 0.3×trade_activity + 0.2×game_sense)")
+    print("  • Base: 50% credit for winning")
+    print("  • Trade activity: +30% for active trading (max 15 trades)")
+    print("  • Game sense: +20% for strategic play (help weak, avoid helping leader)")
+    print()
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1]['overall_score'], reverse=True)
+    for i, st in sorted_scores:
+        print(f"\n{agent_names[i]} (Player {i}):")
+        print(f"  Win rate:            {st['win_rate']:>6.1%}")
+        print(f"  Overall score:       {st['overall_score']:>6.3f} ⭐")
+        print(f"  Game sense:          {st['game_sense']:>6.3f}")
+        print(f"  Trade activity:      {st['trade_activity']:>6.3f}")
+
+    print("\n" + "=" * 70)
+
+    # Return metrics for saving
+    return {
         "average_turns": avg_t,
         "win_rates": {f"player_{i}": rate for i, rate in win_rates.items()},
         "hallucination_stats": {f"player_{i}": st for i, st in hall.items()},
@@ -160,52 +180,67 @@ def main():
         "overall_scores": {f"player_{i}": st for i, st in scores.items()},
     }
 
-    print("\n" + "=" * 60)
-    print("RESULTS SUMMARY")
-    print("=" * 60)
 
-    agent_names = [a.name for a in agents]
+def main():
+    # Configuration
+    N_GAMES = 5  # Start with 5 games for testing
+    TARGET_VP = 8  # Lower target for faster games
+    MAX_TURNS = 150  # Safety net
 
-    print("\n===  Win Rates ===")
-    for i, rate in win_rates.items():
-        print(f"{agent_names[i]:<24} (Player {i}): {rate:.1%}")
+    print("=" * 70)
+    print("🎮 CATAN LLM BENCHMARK v2.1")
+    print("=" * 70)
+    print("\n📋 Configuration:")
+    print(f"  Games:         {N_GAMES}")
+    print(f"  Victory Points: {TARGET_VP}")
+    print(f"  Max Turns:     {MAX_TURNS}")
+    print("\n🤖 Models:")
+    print("  • OpenAI gpt-5-nano")
+    print("  • Claude Haiku 4.5 (cheapest)")
+    print("  • Gemini 2.5 Flash")
+    print("  • Random Baseline")
+    print("\n✨ Features:")
+    print("  ✓ Retry logic with exponential backoff")
+    print("  ✓ Enhanced JSON parsing")
+    print("  ✓ API error tracking")
+    print("  ✓ Bank trades (4:1)")
+    print("  ✓ Robber mechanic")
+    print("  ✓ Discard phase")
+    print("\n🔜 TODO (from README):")
+    print("  • Port trades (3:1, 2:1)")
+    print("  • Proper hex board")
+    print("  • Dynamic scenarios")
+    print("  • Strategy pivot detection")
+    print("=" * 70)
 
-    print("\n===  Hallucination Stats ===")
-    for i, st in hall.items():
-        print(f"{agent_names[i]:<24} (Player {i}):")
-        print(f"  Total decisions: {st['decisions']:.0f}")
-        print(f"  Index errors: {st['index_hallucinations']:.0f}")
-        print(f"  Action failures: {st['action_failures']:.0f}")
-        print(f"  Hallucination rate: {st['hallucination_rate']:.1%}")
-        print(f"  Penalty score: {st['hallucination_penalty_score']:.3f}")
+    # Setup
+    engine = PyCatanEngine(
+        num_players=4,
+        target_vp=TARGET_VP,
+        max_turns=MAX_TURNS,
+        seed=42,
+    )
 
-    print("\n===  Trade Behavior ===")
-    for i, st in trades.items():
-        print(f"{agent_names[i]:<24} (Player {i}):")
-        print(f"  Player trades: {st['num_player_trades']:.0f}")
-        print(f"  Bank trades: {st['num_bank_trades']:.0f}")
-        print(f"  Total trades: {st['total_trades']:.0f}")
-        print(f"  Helping leader: {st['trades_helping_leader_ratio']:.1%}")
-        print(f"  Helping last: {st['trades_helping_last_ratio']:.1%}")
+    agents = build_agents()
+    orchestrator = GameOrchestrator(engine, agents)
 
-    print("\n===  Resource Efficiency ===")
-    for i, st in efficiency.items():
-        print(f"{agent_names[i]:<24} (Player {i}):")
-        print(f"  Build rate: {st['build_rate']:.3f} builds/turn")
-        print(f"  Avg final resources: {st['avg_final_resources']:.1f}")
-        print(f"  Efficiency score: {st['efficiency_score']:.3f}")
+    # Run games
+    print("\n🎲 Starting games...\n")
+    results = orchestrator.play_many_games(n_games=N_GAMES)
 
-    print("\n=== Overall Scores ===")
-    for i, st in scores.items():
-        print(f"{agent_names[i]:<24} (Player {i}):")
-        print(f"  Win rate: {st['win_rate']:.1%}")
-        print(f"  Overall score: {st['overall_score']:.3f}")
-        print(f"  Game sense: {st['game_sense']:.3f}")
-        print(f"  Trade activity: {st['trade_activity']:.3f}")
+    # Display results
+    metrics = print_results(results, agents)
 
-    print("\n" + "=" * 60)
+    # Save to JSON
     save_results_to_json(results, metrics)
-    print("=" * 60)
+
+    print("\n✅ Benchmark complete!")
+    print("\n💡 NEXT STEPS:")
+    print("  1. Review game_results_*.json for detailed analysis")
+    print("  2. Check hallucination rates - should be <10%")
+    print("  3. If API errors persist, increase retry delays")
+    print("  4. Implement port trades for better gameplay")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
